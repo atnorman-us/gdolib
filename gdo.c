@@ -572,6 +572,13 @@ esp_err_t gdo_door_move_to_target(uint32_t target) {
 }
 
 /**
+ * @brief Requests a fresh status update from the GDO. See gdo.h for details.
+*/
+esp_err_t gdo_refresh_status(void) {
+    return get_status();
+}
+
+/**
  * @brief Turns the light on.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if the encoding fails.
 */
@@ -1009,7 +1016,13 @@ done:
         if (g_status.protocol & GDO_PROTOCOL_SEC_PLUS_V1) {
             g_status.toggle_only = true;
         }
-    } else if (!g_protocol_forced) {
+    } else if (!g_protocol_forced && g_status.protocol != GDO_PROTOCOL_SEC_PLUS_V2) {
+        // Only reset to unknown if we never actually confirmed V2. A
+        // failure after V2 was already identified (see comment above
+        // gdo_sync_task()) is almost always a rolling-code mismatch, not
+        // a protocol-identity problem - keep the confirmed protocol so
+        // the retry can skip straight back into the V2 sync loop instead
+        // of redoing the full ~7.5s V1-then-V2 detection sequence.
         g_status.protocol = 0;
     }
 
@@ -1525,8 +1538,54 @@ static void gdo_main_task(void* arg) {
                 uint16_t rx_packet_size = event.uart_event.size;
                 if (!g_status.protocol) {
                     if (rx_packet_size == 2) {
-                        ESP_LOGD(TAG, "Received 2 bytes, using protocol V1");
-                        g_status.protocol = GDO_PROTOCOL_SEC_PLUS_V1;
+                        // A bare byte-count match isn't reliable evidence of
+                        // V1 - this decision is a one-shot commit (this
+                        // whole `if (!g_status.protocol)` block never runs
+                        // again once g_status.protocol is set), and UART
+                        // noise/EMI (confirmed present on real installs via
+                        // frequent "RX data signature error" traffic
+                        // elsewhere in this file) can just as easily
+                        // produce a stray 2-byte read as a real V1 status
+                        // frame can. Confirmed in the field: a genuine
+                        // Security+ 2.0 opener falsely locked into V1 for
+                        // an entire session this way, with garbage door
+                        // state (target sentinel 4294967295) as the only
+                        // "evidence".
+                        //
+                        // Peek at the actual bytes and require at least one
+                        // to fall in the valid V1 command range before
+                        // committing - the same V1_CMD_MIN/MAX bound the V1
+                        // decode loop below already trusts to distinguish
+                        // real command bytes from noise/misalignment.
+                        uint8_t peek[2];
+                        int n = uart_read_bytes(g_config.uart_num, peek, 2, 0);
+                        bool looks_valid = (n == 2) &&
+                            ((peek[0] > V1_CMD_MIN && peek[0] < V1_CMD_MAX) ||
+                             (peek[1] > V1_CMD_MIN && peek[1] < V1_CMD_MAX));
+
+                        if (looks_valid) {
+                            ESP_LOGD(TAG, "Received 2 bytes (0x%02x 0x%02x), using protocol V1",
+                                     peek[0], peek[1]);
+                            g_status.protocol = GDO_PROTOCOL_SEC_PLUS_V1;
+                            // Already consumed these bytes here to inspect
+                            // them - decode this first frame directly
+                            // rather than letting the V1 branch below try
+                            // to read it again, which would either starve
+                            // (nothing left in the FIFO) or wrongly consume
+                            // a future event's bytes instead.
+                            print_buffer(g_status.protocol, peek, false);
+                            decode_v1_packet(peek);
+                        } else {
+                            ESP_LOGD(TAG, "Received 2 bytes (0x%02x 0x%02x) that don't look like a "
+                                     "real V1 command - treating as noise, not committing to protocol V1",
+                                     peek[0], peek[1]);
+                            // Leave g_status.protocol at 0 so this check
+                            // runs again on the next received data instead
+                            // of staying falsely locked out of V2 detection.
+                        }
+                        break; // fully handled above either way - the
+                               // V1/V2 branches below would otherwise
+                               // double-read the FIFO we already consumed.
                     } else if (rx_packet_size == 20 || rx_packet_size == 19 || rx_pending) {
                         ESP_LOGD(TAG, "Received %u bytes, using protocol V2", rx_packet_size);
                         g_status.protocol = GDO_PROTOCOL_SEC_PLUS_V2;

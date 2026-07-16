@@ -200,6 +200,16 @@ esp_err_t gdo_start(gdo_event_callback_t event_callback, void *user_arg);
 esp_err_t gdo_get_status(gdo_status_t *status);
 
 /**
+ * @brief Requests a fresh status update from the GDO. Unlike gdo_get_status(),
+ * which only returns the last known cached status, this actively asks the
+ * opener to report its current state. Useful for polling during a known
+ * transition when the opener isn't otherwise sending updates on its own.
+ * @return ESP_OK on success, ESP_ERR_NO_MEM if the queue is full, ESP_FAIL if
+ * the encoding fails.
+*/
+esp_err_t gdo_refresh_status(void);
+
+/**
  * @brief Starts the task that syncs the state of the GDO with the controller.
  * @return ESP_OK on success, ESP_ERR_NO_MEM if task creation fails, ESP_ERR_NOT_FINISHED if the task is already running.
 */
