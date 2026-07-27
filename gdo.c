@@ -1294,6 +1294,9 @@ static esp_err_t queue_command(gdo_command_t command, uint8_t nibble, uint8_t by
     gdo_tx_message_t message;
     message.cmd = command;
     message.packet = (uint8_t*)malloc(19); // will be freed in the gdo_main_task
+    if (!message.packet) {
+        return ESP_ERR_NO_MEM;
+    }
     message.sent_ms = esp_timer_get_time() / 1000;
 
     // if we are here without a protocol defined then V1 testing failed, proceed with v2
@@ -1863,7 +1866,18 @@ static void update_door_state(const gdo_door_state_t door_state) {
     }
 
     if (door_state == GDO_DOOR_STATE_OPENING || door_state == GDO_DOOR_STATE_CLOSING) {
-        if (g_status.door_position >= 0 && g_status.close_ms > 0 && g_status.open_ms > 0) {
+        // Only the RELEVANT direction's travel time needs to be known to
+        // interpolate this transition - requiring both open_ms and
+        // close_ms was an unnecessary coupling. Confirmed in the field:
+        // open_ms was already learned from an earlier cycle, but close_ms
+        // hadn't been (a close that skipped straight to the final frame
+        // with no measurable Closing period), so this transition's own
+        // Opening interpolation never started despite everything needed
+        // for it already being known - motor genuinely running, raw
+        // frozen the whole time, and a downstream watchdog wrongly
+        // declared the door "Closed" partway through a real Opening.
+        uint16_t relevant_ms = (door_state == GDO_DOOR_STATE_OPENING) ? g_status.open_ms : g_status.close_ms;
+        if (g_status.door_position >= 0 && relevant_ms > 0) {
             g_door_start_moving_ms = (uint32_t)(esp_timer_get_time() / 1000);
             if (esp_timer_start_periodic(door_position_sync_timer, 500 * 1000) != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to start door position sync timer");
@@ -2084,6 +2098,39 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
     if (motor_state != g_status.motor) {
         g_status.motor = motor_state;
         queue_event((gdo_event_t){GDO_EVENT_MOTOR_UPDATE});
+
+        // Also arm door_position interpolation here, not only on an
+        // explicit OPENING/CLOSING STATUS frame (see the matching block
+        // in decode_packet()/wherever door_state is processed). MOTOR_ON
+        // is a short, simple frame - confirmed in the field to survive a
+        // noise burst that ate several consecutive STATUS frames right
+        // after it, including the one confirming the transition
+        // direction. Without this, door_position stayed frozen at its
+        // pre-transition value for an entire real, successful ~16s close,
+        // even though the door was moving completely normally the whole
+        // time - callers watching door_position (including watchdogs
+        // built on top of this library) had no way to distinguish that
+        // from a genuinely stalled motor. door_target is already valid
+        // here regardless of which frame arrives first - gdo_door_open()/
+        // gdo_door_close() set it immediately when called, well before
+        // the command is even transmitted, so it doesn't depend on this
+        // motor-state update racing against a STATUS frame either.
+        if (motor_state == GDO_MOTOR_STATE_ON && g_status.door_position >= 0) {
+            // Same fix as the explicit-STATUS-frame trigger above: only
+            // the relevant direction's travel time needs to be known, not
+            // both. door_target (0 = opening, 10000 = closing) is already
+            // valid here regardless of which frame arrives first, so it's
+            // used to pick which duration is actually relevant, exactly
+            // like the STATUS-frame path uses door_state for the same
+            // purpose.
+            uint16_t relevant_ms = (g_status.door_target == 0) ? g_status.open_ms : g_status.close_ms;
+            if (relevant_ms > 0) {
+                g_door_start_moving_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                if (esp_timer_start_periodic(door_position_sync_timer, 500 * 1000) != ESP_OK) {
+                    ESP_LOGD(TAG, "door position sync timer already running or failed to start");
+                }
+            }
+        }
     }
 }
 
@@ -2118,10 +2165,18 @@ inline static void update_motion_state(gdo_motion_state_t motion_state) {
     if (g_status.motion != motion_state) {
         g_status.motion = motion_state;
         queue_event((gdo_event_t){GDO_EVENT_MOTION_UPDATE});
-    }
 
-    if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
-        get_status();
+        // Only request a fresh full status on a genuine change, not on every
+        // repeated MOTION frame - this previously fired unconditionally on
+        // every single MOTION event regardless of whether motion state
+        // actually changed, which is a meaningful amount of avoidable
+        // traffic during a long motion-active period (confirmed in real
+        // captures: MOTION frames repeating every few seconds while
+        // someone's active in the garage, each one triggering an extra
+        // GET_STATUS round-trip even when motion was already Detected).
+        if (g_status.protocol == GDO_PROTOCOL_SEC_PLUS_V2) {
+            get_status();
+        }
     }
 }
 
