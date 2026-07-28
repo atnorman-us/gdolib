@@ -2125,6 +2125,23 @@ inline static void update_motor_state(gdo_motor_state_t motor_state) {
             // purpose.
             uint16_t relevant_ms = (g_status.door_target == 0) ? g_status.open_ms : g_status.close_ms;
             if (relevant_ms > 0) {
+                // door_position_sync_timer_cb() picks its interpolation
+                // direction from g_status.door (OPENING vs anything else),
+                // not from door_target - so it must be set here too, not
+                // just used to pick relevant_ms above. Confirmed in the
+                // field: when the explicit OPENING STATUS frame that
+                // normally sets this got lost to RX noise right after
+                // MOTOR_ON, g_status.door stayed at its stale pre-transition
+                // value (Closed) for the whole callback's lifetime - the
+                // timer then interpolated position in the WRONG direction
+                // (toward Closed instead of Open), and every
+                // GDO_EVENT_DOOR_POSITION_UPDATE it queued carried that
+                // stale Closed state straight out to callers, who forwarded
+                // it directly (this library documents status->door as
+                // authoritative). Set it optimistically from door_target -
+                // the real STATUS frame, if it arrives, just reconfirms the
+                // same value.
+                g_status.door = (g_status.door_target == 0) ? GDO_DOOR_STATE_OPENING : GDO_DOOR_STATE_CLOSING;
                 g_door_start_moving_ms = (uint32_t)(esp_timer_get_time() / 1000);
                 if (esp_timer_start_periodic(door_position_sync_timer, 500 * 1000) != ESP_OK) {
                     ESP_LOGD(TAG, "door position sync timer already running or failed to start");
